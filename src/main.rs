@@ -32,13 +32,17 @@ enum Instr {
     Imm(Reg, u16),       // r0 = imm
     Load(Reg, u16),      // r0 = stack[imm..imm+2]
     Store(u16, Reg),     // stack[imm..imm+2] = r0
+    Add(Reg, Reg, Reg),  // r0 = r1 + r2
     Sub(Reg, Reg, Reg),  // r0 = r1 - r2
     Mul(Reg, Reg, Reg),  // r0 = r1 * r2
+    Div(Reg, Reg, Reg),  // r0 = r1 / r2
     Jump(String),        // pc = label
     JumpIf(Reg, String), // if r3 > 0, jump.
     Call(String),        // pc = label
     Ret,                 // pc = back
     Syscall(Syscall),    // 0 = open, 1 = create, 2 = read, 3 = write
+    LoadInd(Reg, Reg),   // r0 = mem[r1]
+    StoreInd(Reg, Reg),  // mem[r0] = r1
 }
 
 struct VM {
@@ -50,6 +54,8 @@ struct VM {
     ret: Vec<u16>, // stack of addresses to return to
     labels: HashMap<String, u16>,
 }
+
+const CALLER_SAVED_REGS: [Reg; 3] = [Reg::R1, Reg::R2, Reg::R3];
 
 impl VM {
     fn new() -> Self {
@@ -115,19 +121,29 @@ impl VM {
                     self.pc += 1
                 }
                 Instr::Load(reg, val) => {
-                    self.write(self.read_reg(reg), self.read(*val));
+                    let v = self.read(*val);
+                    self.write_reg(reg, v);
                     self.pc += 1
                 }
                 Instr::Store(val, reg) => {
-                    self.write(self.read_reg(reg), *val);
+                    let v = self.read_reg(reg);
+                    self.write(*val, v);
+                    self.pc += 1
+                }
+                Instr::Add(r0, r1, r2) => {
+                    self.write_reg(r0, self.read_reg(r1) + self.read_reg(r2));
+                    self.pc += 1
+                }
+                Instr::Sub(r0, r1, r2) => {
+                    self.write_reg(r0, self.read_reg(r1) - self.read_reg(r2));
                     self.pc += 1
                 }
                 Instr::Mul(r0, r1, r2) => {
                     self.write_reg(r0, self.read_reg(r1) * self.read_reg(r2));
                     self.pc += 1
                 }
-                Instr::Sub(r0, r1, r2) => {
-                    self.write_reg(r0, self.read_reg(r1) - self.read_reg(r2));
+                Instr::Div(r0, r1, r2) => {
+                    self.write_reg(r0, self.read_reg(r1) / self.read_reg(r2));
                     self.pc += 1
                 }
                 Instr::Jump(label) => {
@@ -141,12 +157,12 @@ impl VM {
                     }
                 }
                 Instr::Call(label) => {
-                    for (i, reg) in [Reg::R1, Reg::R2, Reg::R3].iter().enumerate() {
+                    for (i, reg) in CALLER_SAVED_REGS.iter().enumerate() {
                         let val = self.read_reg(reg);
                         let addr = self.sp.wrapping_add((i as u16) * 2);
                         self.write(addr, val);
                     }
-                    self.sp = self.sp.wrapping_add(6);
+                    self.sp = self.sp.wrapping_add((CALLER_SAVED_REGS.len() * 2) as u16);
                     self.ret.push(self.pc + 1);
                     self.pc = *self.labels.get(label).unwrap();
                 }
@@ -159,8 +175,8 @@ impl VM {
                         }
                     };
 
-                    self.sp = self.sp.wrapping_sub(6);
-                    for (i, reg) in [Reg::R1, Reg::R2, Reg::R3].iter().enumerate() {
+                    self.sp = self.sp.wrapping_sub((CALLER_SAVED_REGS.len() * 2) as u16);
+                    for (i, reg) in CALLER_SAVED_REGS.iter().enumerate() {
                         let addr = self.sp.wrapping_add((i as u16) * 2);
                         let val = self.read(addr);
                         self.write_reg(reg, val);
@@ -175,6 +191,18 @@ impl VM {
                     }
                     Syscall::Exit => break,
                 },
+                Instr::LoadInd(dest, addr) => {
+                    let a = self.read_reg(addr);
+                    let val = self.read(a);
+                    self.write_reg(dest, val);
+                    self.pc += 1;
+                }
+                Instr::StoreInd(addr, src) => {
+                    let a = self.read_reg(addr);
+                    let val = self.read_reg(src);
+                    self.write(a, val);
+                    self.pc += 1;
+                }
             }
         }
     }
@@ -186,7 +214,7 @@ fn main() {
 
     let prog = vec![
         Instr::Label("main".into()),    // main:
-        Instr::Imm(Reg::R0, 5),         //   r0 = 5
+        Instr::Imm(Reg::R0, 6),         //   r0 = 6
         Instr::Call("fact".into()),     //   call fact
         Instr::Syscall(Syscall::Write), //   print r0
         Instr::Syscall(Syscall::Exit),  //   exit
@@ -207,5 +235,58 @@ fn main() {
         Instr::Ret,
     ];
 
-    vm.run(&prog);
+    let memcpy = vec![
+        // ─── main ───────────────────────────────────────
+        Instr::Label("main".into()),
+        // 1) write {1,2,3} into source at 0x0100,0x0102,0x0104
+        Instr::Imm(Reg::R0, 1),
+        Instr::Store(0x0100, Reg::R0),
+        Instr::Imm(Reg::R0, 2),
+        Instr::Store(0x0102, Reg::R0),
+        Instr::Imm(Reg::R0, 3),
+        Instr::Store(0x0104, Reg::R0),
+        // 2) set up memcpy arguments:
+        //    R0 = src_ptr, R1 = dst_ptr, R2 = len_in_words
+        Instr::Imm(Reg::R0, 0x0100), // src = 0x0100
+        Instr::Imm(Reg::R1, 0x0200), // dst = 0x0200
+        Instr::Imm(Reg::R2, 3),      // len = 3 words
+        Instr::Call("memcpy".into()),
+        // 3) reset for printing
+        Instr::Imm(Reg::R1, 0x0200), // dst = 0x0200
+        Instr::Imm(Reg::R2, 3),      // count = 3
+        // 4) print_loop: load from [R1], print, ptr+=2, count--
+        Instr::Label("print_loop".into()),
+        Instr::LoadInd(Reg::R0, Reg::R1),
+        Instr::Syscall(Syscall::Write),
+        Instr::Imm(Reg::R0, 2),
+        Instr::Add(Reg::R1, Reg::R1, Reg::R0), // dst_ptr += 2
+        Instr::Imm(Reg::R0, 1),
+        Instr::Sub(Reg::R2, Reg::R2, Reg::R0), // count--
+        Instr::JumpIf(Reg::R2, "print_loop".into()),
+        Instr::Syscall(Syscall::Exit),
+        // ─── memcpy subroutine ───────────────────────────
+        Instr::Label("memcpy".into()),
+        // if len (R2) == 0, return immediately
+        Instr::JumpIf(Reg::R2, "copy_loop".into()),
+        Instr::Ret,
+        Instr::Label("copy_loop".into()),
+        // load one word from [R0] → R3
+        Instr::LoadInd(Reg::R3, Reg::R0),
+        // store that word from R3 → [R1]
+        Instr::StoreInd(Reg::R1, Reg::R3),
+        // decrement length: R2 = R2 - 1
+        Instr::Imm(Reg::R3, 1),
+        Instr::Sub(Reg::R2, Reg::R2, Reg::R3),
+        // bump src ptr: R0 = R0 + 2
+        Instr::Imm(Reg::R3, 2),
+        Instr::Add(Reg::R0, Reg::R0, Reg::R3),
+        // bump dst ptr: R1 = R1 + 2
+        Instr::Imm(Reg::R3, 2),
+        Instr::Add(Reg::R1, Reg::R1, Reg::R3),
+        // loop back if R2 > 0
+        Instr::JumpIf(Reg::R2, "copy_loop".into()),
+        Instr::Ret,
+    ];
+
+    vm.run(&memcpy);
 }
